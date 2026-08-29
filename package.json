@@ -1,5 +1,11 @@
 {
   "name": "dogfood-uns",
   "private": true,
-  "version": "0.0.0"
+  "version": "0.0.0",
+  "dependencies": {
+    "@gemstack/skill-branches": "file:../sb-pkg/gemstack-skill-branches-0.0.1.tgz"
+  },
+  "scripts": {
+    "postinstall": "npx use-npm-skills"
+  }
 }

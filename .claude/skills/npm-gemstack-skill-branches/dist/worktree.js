@@ -1,0 +1,364 @@
+import { basename, dirname, join } from 'node:path';
+import { realpath } from 'node:fs/promises';
+import { nodeGitRunner, checkoutRoot } from './git.js';
+import { BRANCHES_DIR, AGENT_BRANCH_PREFIX, isSafeAgentId, isAgentBranch, agentBranchName, agentIdFromWorktreeDir } from './branch-names.js';
+/**
+ * Git-worktree lifecycle for concurrent agents (#453/#735): give each agent its own
+ * checkout so N agents on one repo never fight over the working tree. Pure plumbing
+ * over the {@link GitRunner} seam: this module only knows how to add, list, name,
+ * remove, and prune worktrees, and to read what a retention decision needs.
+ */
+/** The path an agent's worktree gets (#1580): `<repo>/.branches/<agent branch>`. */
+export function worktreePath(repo, agentId) {
+    return join(repo, BRANCHES_DIR, agentBranchName(agentId));
+}
+async function nodeReaddir(path) {
+    const { readdir } = await import('node:fs/promises');
+    const entries = await readdir(path, { withFileTypes: true }).catch(() => []);
+    return entries.filter(entry => entry.isDirectory()).map(entry => entry.name);
+}
+/**
+ * Every checkout directory on disk (#1580): a directory under `.branches/` named as an agent
+ * branch. Only directories count — the same place holds the rename links (#1589), symlinks named
+ * as agent branches too, which are views, not checkouts. Forgiving: a missing root yields nothing.
+ */
+export async function worktreeDirEntries(repo, readdir = nodeReaddir) {
+    const root = join(repo, BRANCHES_DIR);
+    const entries = [];
+    for (const name of await readdir(root).catch(() => [])) {
+        const agentId = agentIdFromWorktreeDir(name);
+        if (isAgentBranch(name) && isSafeAgentId(agentId))
+            entries.push({ path: join(root, name), agentId });
+    }
+    return entries;
+}
+/**
+ * The agent ids that have a worktree directory (#737/#1580). Forgiving — a project that never ran
+ * concurrently has no such dir and yields `[]`.
+ */
+export async function listWorktreeDirs(repo, readdir = nodeReaddir) {
+    return [...new Set((await worktreeDirEntries(repo, readdir)).map(entry => entry.agentId))];
+}
+/**
+ * Create a worktree for an agent on a fresh branch: `git worktree add -b <branch>
+ * <path> [base]`. Git makes the leaf dir (and any missing parents) itself. The
+ * `agentId` is validated as path-safe first so a caller can never traverse out of
+ * `.branches/`. Rejects on any git failure (a caller that wants a
+ * run needs its checkout, so failure must surface, not be swallowed).
+ */
+export async function addWorktree(repo, opts, git = nodeGitRunner()) {
+    if (!isSafeAgentId(opts.agentId))
+        throw new Error(`unsafe agent id: ${opts.agentId}`);
+    const path = worktreePath(repo, opts.agentId);
+    await git(['worktree', 'add', '-b', opts.branch, path, ...(opts.base ? [opts.base] : [])], repo);
+    return { path, branch: opts.branch };
+}
+/**
+ * Check an *existing* branch out into an agent's worktree (#762): `git worktree add <path> <branch>`,
+ * no `-b`. Continuing an agent puts it back on the branch its work is already on, rather than
+ * branching again from HEAD and stranding what it did last time.
+ *
+ * A branch that is gone is recreated from HEAD (#1650): the only branch the package deletes is
+ * one that held nothing past a commit the remote already had, so HEAD is where its work was.
+ * Anything else git refuses — the branch checked out elsewhere, say — still rejects, like
+ * {@link addWorktree}: a continued agent needs its checkout.
+ */
+export async function attachWorktree(repo, opts, git = nodeGitRunner()) {
+    if (!isSafeAgentId(opts.agentId))
+        throw new Error(`unsafe agent id: ${opts.agentId}`);
+    const path = worktreePath(repo, opts.agentId);
+    try {
+        await git(['worktree', 'add', path, opts.branch], repo);
+    }
+    catch (err) {
+        // `worktree add <path> <name>` also resolves a remote-only `origin/<name>`, so the existence
+        // check comes after the attempt, not before it.
+        const exists = await git(['show-ref', '--verify', '--quiet', `refs/heads/${opts.branch}`], repo).then(() => true, () => false);
+        if (exists)
+            throw err;
+        await git(['worktree', 'add', '-b', opts.branch, path], repo);
+    }
+    return { path, branch: opts.branch };
+}
+/**
+ * Every worktree registered for the repo (the main checkout included). Forgiving:
+ * a non-repo / git failure yields `[]` so a reconcile scan never throws.
+ */
+export async function listWorktrees(repo, git = nodeGitRunner()) {
+    try {
+        return parseWorktreeList(await git(['worktree', 'list', '--porcelain'], repo));
+    }
+    catch {
+        return [];
+    }
+}
+/**
+ * Parse `git worktree list --porcelain`: blank-line-separated records, each with
+ * a `worktree <path>` line, a `HEAD <sha>` line, and either `branch refs/heads/...`
+ * or `detached`. Extra attributes (bare/locked/prunable) are ignored. Exported so
+ * the parsing is unit-testable without a real repo.
+ */
+export function parseWorktreeList(porcelain) {
+    const entries = [];
+    for (const block of porcelain.split(/\n\s*\n/)) {
+        let path;
+        let head = '';
+        let branch;
+        for (const line of block.split('\n')) {
+            if (line.startsWith('worktree '))
+                path = line.slice('worktree '.length).trim();
+            else if (line.startsWith('HEAD '))
+                head = line.slice('HEAD '.length).trim();
+            else if (line.startsWith('branch '))
+                branch = line.slice('branch '.length).trim().replace(/^refs\/heads\//, '');
+        }
+        if (path)
+            entries.push({ path, head, ...(branch ? { branch } : {}) });
+    }
+    return entries;
+}
+/**
+ * Remove an agent's worktree. Tolerant of an already-gone / never-registered path so
+ * teardown stays idempotent (a caller may run it twice).
+ *
+ * Plain removal first: it refuses a checkout git considers unclean, which after the
+ * caller's {@link worktreeClean} check means a state we did not anticipate. Falling back to
+ * `--force` keeps teardown working (an ignored build artifact must not strand a
+ * worktree forever), but it says so, because forcing past unknown state is exactly
+ * how uncommitted work got deleted in the first place.
+ */
+export async function removeWorktree(repo, path, git = nodeGitRunner()) {
+    try {
+        await git(['worktree', 'remove', path], repo);
+        return;
+    }
+    catch {
+        // Unclean by git's reckoning, already removed, or never registered: try forcing.
+    }
+    try {
+        await git(['worktree', 'remove', '--force', path], repo);
+        console.log(`[branches] forced removal of worktree ${path} (git called it unclean)`);
+    }
+    catch {
+        // Already removed, or never registered: nothing to do.
+    }
+}
+/**
+ * Delete a branch that holds nothing (#1650). `-D`, because "merged" in git's eyes is the wrong
+ * test: the caller proved the tip is a commit the remote already has, which is the stronger fact.
+ * Forgiving: the checkout is already gone by the time this runs, and a branch that would not
+ * delete is a leftover name, not lost work.
+ */
+export async function deleteBranch(repo, branch, git = nodeGitRunner()) {
+    await git(['branch', '-D', branch], repo).catch(() => undefined);
+}
+/**
+ * Whether `path` is the root of a git worktree — the main checkout's or a linked one (#1654).
+ *
+ * Git answers for any directory *inside* a repository, so a `.branches/<agent>` directory that is
+ * no longer a worktree (a checkout removed by hand, a marker written after teardown) makes every
+ * git command run in it act on the enclosing repo: the user's own checkout, on the user's own
+ * branch. The one question that tells the two apart is whether git's top level is this very
+ * directory. False on any failure, and the caller leaves the directory alone.
+ */
+export async function isWorktreeRoot(path, git = nodeGitRunner()) {
+    try {
+        const top = (await git(['rev-parse', '--show-toplevel'], path)).trim();
+        if (!top)
+            return false;
+        // Both sides resolved: macOS's tmpdir sits behind the /var -> /private/var link, and git
+        // reports the resolved path.
+        return (await realpath(top)) === (await realpath(path));
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * The branch checked out at `path` when `path` is a worktree root (#1654), else `undefined` —
+ * the read every consumer of a `.branches/<agent>` directory wants, so none of them can take the
+ * enclosing repo's branch for the run's.
+ */
+export async function worktreeBranch(path, git = nodeGitRunner()) {
+    return (await isWorktreeRoot(path, git)) ? currentBranch(path, git) : undefined;
+}
+/**
+ * The branch checked out at `path`, or `undefined` when detached / not a repo.
+ * Forgiving, like {@link listWorktrees}: callers use it to decide, not to fail.
+ */
+export async function currentBranch(path, git = nodeGitRunner()) {
+    try {
+        const name = (await git(['rev-parse', '--abbrev-ref', 'HEAD'], path)).trim();
+        return name && name !== 'HEAD' ? name : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * The project a directory belongs to (#1725): the checkout whose `.branches/` holds the agent
+ * checkouts. From inside an agent's checkout that is two levels up, by the layout every checkout
+ * is created with; from anywhere else it is the checkout itself. Read from the layout rather than
+ * from git's common dir, so a project that is itself a linked worktree, or a submodule, answers
+ * with the directory the caller registered. Rejects outside a repo.
+ */
+export async function projectRoot(cwd, git = nodeGitRunner()) {
+    const checkout = await checkoutRoot(cwd, git);
+    const parent = dirname(checkout);
+    return basename(parent) === BRANCHES_DIR ? dirname(parent) : checkout;
+}
+/** A session name as the agent picks it: the charset the skill asks for. */
+export function isSessionName(name) {
+    return /^[a-z0-9-]+$/.test(name);
+}
+/** How often a rename lost to a sibling naming the same thing at the same moment is retried. */
+const NAME_ATTEMPTS = 3;
+/**
+ * Name the session (#1725): rename the checkout's branch to `agent-<name>`. A rename, not a new
+ * branch, so the branch the checkout was born on is the branch it ends on and nothing is left
+ * behind to clean up. Only a branch the package minted is ever renamed: an agent that somehow
+ * runs in the user's own checkout must not rename `main`.
+ *
+ * A taken name gets a numeric suffix (`agent-<name>-2`, `-3`, …) rather than a refusal: the agent
+ * asked for a name, and the caller reads back the one it got. Taken means any local branch or
+ * any remote-tracking branch, so the later push does not land on someone else's branch — except
+ * the checkout's own branch, pushed or not, which is why asking again for the name the checkout
+ * already carries (suffixed or not) changes nothing. Two checkouts naming the same thing at the
+ * same moment race on the rename itself; the loser reads the branches again and takes the next
+ * free suffix.
+ */
+export async function nameBranch(path, name, git = nodeGitRunner()) {
+    if (!isSessionName(name))
+        return { ok: false, reason: 'invalid-name' };
+    const wanted = `${AGENT_BRANCH_PREFIX}${name}`;
+    if (!(await isWorktreeRoot(path, git)))
+        return { ok: false, reason: 'not-a-worktree' };
+    const current = await currentBranch(path, git);
+    if (!current)
+        return { ok: false, reason: 'no-branch' };
+    if (!isAgentBranch(current))
+        return { ok: false, reason: 'not-an-agent-branch' };
+    for (let attempt = 1;; attempt++) {
+        const taken = await branchNames(path, git);
+        taken.delete(current);
+        let branch = wanted;
+        for (let n = 2; taken.has(branch); n++)
+            branch = `${wanted}-${n}`;
+        if (branch === current)
+            return { ok: true, branch };
+        try {
+            await git(['branch', '-m', current, branch], path);
+            return { ok: true, branch };
+        }
+        catch (err) {
+            if (attempt >= NAME_ATTEMPTS || !/already exists/.test(err instanceof Error ? err.message : String(err)))
+                throw err;
+        }
+    }
+}
+/** Every branch name the repo knows, local and remote-tracking, without the remote's prefix. */
+async function branchNames(path, git) {
+    const out = await git(['for-each-ref', '--format=%(refname)', 'refs/heads/', 'refs/remotes/'], path);
+    const names = new Set();
+    for (const ref of out.split('\n')) {
+        const heads = ref.match(/^refs\/heads\/(.+)$/);
+        if (heads?.[1])
+            names.add(heads[1]);
+        const remotes = ref.match(/^refs\/remotes\/[^/]+\/(.+)$/);
+        if (remotes?.[1])
+            names.add(remotes[1]);
+    }
+    return names;
+}
+/**
+ * `git worktree prune`: drop administrative entries for worktree dirs a crash left
+ * behind. Never removes a live worktree, so it is always safe. Forgiving.
+ */
+export async function pruneWorktrees(repo, git = nodeGitRunner()) {
+    try {
+        await git(['worktree', 'prune'], repo);
+    }
+    catch {
+        // Not a repo / nothing to prune: no-op.
+    }
+}
+/** A {@link SizeRunner} over `du -sk`: one process, and it does not follow the symlinked deps (#736). */
+export function nodeSizeRunner() {
+    return path => new Promise((resolvePromise, rejectPromise) => {
+        void import('node:child_process').then(({ execFile }) => {
+            execFile('du', ['-sk', path], { timeout: 5_000 }, (err, stdout) => err ? rejectPromise(err) : resolvePromise(stdout));
+        });
+    });
+}
+/**
+ * A worktree's size on disk in bytes, or undefined when it cannot be read (#798). Best-effort by
+ * design: this only ever labels a "remove this" button, so a missing number costs nothing while a
+ * throw or a hang would cost the listing it sits in. `du` is absent on Windows, which reads as
+ * unknown like any other failure.
+ */
+export async function worktreeSize(path, size = nodeSizeRunner()) {
+    try {
+        const kb = Number.parseInt((await size(path)).trim().split(/\s+/)[0] ?? '', 10);
+        return Number.isFinite(kb) ? kb * 1024 : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * Whether a branch is on the remote, with the local tip already there.
+ *
+ * The one predicate the whole retention story is built on: nothing local is ever the last copy of
+ * work, so anything the remote has may be deleted and anything it does not have stays. It replaced
+ * three interacting rules — a clean finish removes the checkout, a failure keeps it, a merged
+ * branch reclaims it later — each of which asked *what state did this session end in* rather than
+ * *is this recoverable*.
+ *
+ * `git rev-parse` of the remote-tracking ref, then a merge-base check: the ref existing is not
+ * enough, because a branch pushed and then committed to again has a tip the remote has never seen.
+ * Reads only local refs (no fetch), so it is cheap enough to ask on every teardown — the remote ref
+ * is written by the push this is checking for, which is what makes that sound.
+ *
+ * Anything unreadable answers `false`. A repo with no remote configured therefore keeps every
+ * checkout, which is the honest outcome: there is nowhere for the work to be recoverable from.
+ */
+export async function branchPushed(repo, branch, git = nodeGitRunner()) {
+    try {
+        const local = (await git(['rev-parse', '--verify', `refs/heads/${branch}`], repo)).trim();
+        const remote = (await git(['rev-parse', '--verify', `refs/remotes/origin/${branch}`], repo)).trim();
+        if (!local || !remote)
+            return false;
+        if (local === remote)
+            return true;
+        // The remote may be ahead (someone pushed on top): what matters is that our tip is in it.
+        await git(['merge-base', '--is-ancestor', local, remote], repo);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Whether the checkout has nothing uncommitted. A read, never a commit (#1638): the package
+ * commits nothing on an agent's behalf, so a checkout holding uncommitted work is one the caller
+ * keeps. Throws when git cannot answer, so the caller keeps the checkout rather than guessing.
+ */
+export async function worktreeClean(path, git = nodeGitRunner()) {
+    return !(await git(['status', '--porcelain'], path)).trim();
+}
+/**
+ * Whether the repo has any remote configured at all. What a caller asks once per project before reclaiming its checkouts: with
+ * no remote, {@link branchPushed} is false for every checkout and the push cannot land, so the
+ * whole per-checkout probe-and-push cycle is doomed before it starts — and that answer cannot
+ * change between two checkouts of the same pass. Anything unreadable answers `false`, like
+ * {@link branchPushed}: keeping a checkout is the safe direction.
+ */
+export async function repoHasRemote(repo, git = nodeGitRunner()) {
+    try {
+        return (await git(['remote'], repo)).trim().length > 0;
+    }
+    catch {
+        return false;
+    }
+}
+//# sourceMappingURL=worktree.js.map

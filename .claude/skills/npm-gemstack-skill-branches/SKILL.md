@@ -38,3 +38,4 @@ branches status
 It must report `"clean": true`. Uncommitted work blocks the checkout from being reclaimed, and is not part of what gets published.
 
 Do not push, and do not open the pull request yourself: publishing — push, pull request, merge — is done for you, as the user configured it.
+# v2 marker

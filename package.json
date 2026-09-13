@@ -1,0 +1,9 @@
+{
+  "name": "throwaway",
+  "private": true,
+  "devDependencies": {
+    "@gemstack/skill-queue": "0.0.1",
+    "@gemstack/skill-tickets": "0.0.1",
+    "@gemstack/skill-logs": "0.0.1"
+  }
+}

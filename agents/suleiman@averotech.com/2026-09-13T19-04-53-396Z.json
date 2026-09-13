@@ -1,0 +1,28 @@
+{
+  "id": "2026-09-13T19-04-53-396Z",
+  "startedAt": "2026-09-13T19:04:53.596Z",
+  "endedAt": "2026-09-13T19:05:02.095Z",
+  "status": "done",
+  "intent": "/work-queue",
+  "driver": "claude-code",
+  "model": "claude-opus-5",
+  "branch": "agent-2026-09-13T19-04-53-396Z",
+  "cost": 0.11525750000000001,
+  "caller": {
+    "updatedAt": "2026-09-13T19:05:02.603Z",
+    "pid": 62056,
+    "host": "Suleimans-MacBook-Pro.local",
+    "kind": "prompt",
+    "handoff": {
+      "push": true,
+      "pr": true,
+      "merge": true
+    },
+    "workspace": "/private/tmp/claude-501/-Users-suleiman-Projects-gemstack/bd065b1b-731c-46a6-a8be-570b96e1d052/scratchpad/rig2/work/.branches/agent-2026-09-13T19-04-53-396Z",
+    "sessionLink": "https://claude.ai/code",
+    "sessionId": "16f881f5-d1d1-417b-9c20-0c8435593a16",
+    "handoffReport": "skipped",
+    "handoffSkip": "no-commits",
+    "mergeOutcome": "withheld"
+  }
+}

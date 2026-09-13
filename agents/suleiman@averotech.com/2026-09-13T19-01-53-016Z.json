@@ -1,0 +1,32 @@
+{
+  "id": "2026-09-13T19-01-53-016Z",
+  "startedAt": "2026-09-13T19:01:53.218Z",
+  "endedAt": "2026-09-13T19:02:59.558Z",
+  "status": "done",
+  "intent": "/work-queue",
+  "driver": "claude-code",
+  "model": "claude-opus-5",
+  "branch": "agent-add-contributing",
+  "pr": {
+    "number": 2,
+    "url": "https://github.com/suleimansh/dogfood-uns/pull/2"
+  },
+  "cost": 0.348629,
+  "caller": {
+    "updatedAt": "2026-09-13T19:03:05.770Z",
+    "pid": 51345,
+    "host": "Suleimans-MacBook-Pro.local",
+    "kind": "prompt",
+    "handoff": {
+      "push": true,
+      "pr": true,
+      "merge": true
+    },
+    "workspace": "/private/tmp/claude-501/-Users-suleiman-Projects-gemstack/bd065b1b-731c-46a6-a8be-570b96e1d052/scratchpad/rig2/work/.branches/agent-2026-09-13T19-01-53-016Z",
+    "sessionLink": "https://claude.ai/code",
+    "sessionId": "e3ccc49d-95f8-4292-98a8-1e01e5744a5b",
+    "readyForMerge": true,
+    "handoffReport": "done",
+    "mergeOutcome": "watched"
+  }
+}
